@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 )
 
 type (
@@ -360,54 +361,84 @@ func getAllDnsRecords(ctx *cli.Context) ([]*zoneDnsRecord, error) {
 	}
 	verbose := ctx.Bool("verbose")
 
+	zones, err := getAllZones(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error getting all zones: %w", err)
+	}
+
+	zoneDnsRecords := make([]*zoneDnsRecord, 0, len(zones))
 	client := &http.Client{}
-	req, err := http.NewRequest("GET", url+"zones", nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-
-	if email != "" && key != "" {
-		req.Header.Add("X-Auth-Email", email)
-		req.Header.Add("X-Auth-Key", key)
-	} else {
-		req.Header.Add("Authorization", "Bearer "+token)
-	}
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error sending request: %w", err)
-	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			log.Printf("error closing response body: %v", err)
-		}
-	}(resp.Body)
-
-	decoder := json.NewDecoder(resp.Body)
-	var response listZonesResponse
-	err = decoder.Decode(&response)
-	if err != nil {
-		return nil, fmt.Errorf("error decoding response: %w", err)
-	}
-
-	if !response.Success {
-		return nil, fmt.Errorf("error response: %v", response.Errors)
-	}
-
-	if verbose {
-		fmt.Printf("Found %d zones\n", len(response.Result))
-	}
-
-	zoneDnsRecords := make([]*zoneDnsRecord, 0, len(response.Result))
-	for i, zone := range response.Result {
+	for i, zone := range zones {
 		if verbose {
-			fmt.Printf("Fetching zone %s; %d/%d\n", zone.Name, i+1, len(response.Result))
+			fmt.Printf("Fetching zone %s; %d/%d\n", zone.Name, i+1, len(zones))
 		}
-		req, err := http.NewRequest("GET", url+"zones/"+zone.Id+"/dns_records", nil)
+		page := 1
+		for {
+			req, err := http.NewRequest("GET", url+"zones/"+zone.Id+"/dns_records?page="+strconv.Itoa(page), nil)
+			if err != nil {
+				return nil, fmt.Errorf("error creating request: %w", err)
+			}
+
+			if email != "" && key != "" {
+				req.Header.Add("X-Auth-Email", email)
+				req.Header.Add("X-Auth-Key", key)
+			} else {
+				req.Header.Add("Authorization", "Bearer "+token)
+			}
+			req.Header.Add("Content-Type", "application/json")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, fmt.Errorf("error sending request: %w", err)
+			}
+
+			decoder := json.NewDecoder(resp.Body)
+			var response listZoneDnsRecordsResponse
+			err = decoder.Decode(&response)
+			if err != nil {
+				return nil, fmt.Errorf("error decoding response: %w", err)
+			}
+
+			if !response.Success {
+				return nil, fmt.Errorf("error response: %v", response.Errors)
+			}
+
+			if len(response.Result) == 0 {
+				break
+			}
+			page++
+			zoneDnsRecords = append(zoneDnsRecords, response.Result...)
+			err = resp.Body.Close()
+			if err != nil {
+				log.Printf("error closing response body: %v", err)
+			}
+		}
+	}
+
+	return zoneDnsRecords, nil
+}
+
+func getAllZones(ctx *cli.Context) ([]*zone, error) {
+	var zones []*zone
+
+	email := ctx.String("email")
+	key := ctx.String("key")
+	token := ctx.String("token")
+	if email == "" && key == "" && token == "" {
+		return zones, fmt.Errorf("email & key or token must be provided")
+	}
+	url := ctx.String("url")
+	if url == "" {
+		url = "https://api.cloudflare.com/client/v4/"
+	}
+	verbose := ctx.Bool("verbose")
+
+	client := &http.Client{}
+	page := 1
+	for {
+		req, err := http.NewRequest("GET", url+"zones?page="+strconv.Itoa(page), nil)
 		if err != nil {
-			return nil, fmt.Errorf("error creating request: %w", err)
+			return zones, fmt.Errorf("error creating request: %w", err)
 		}
 
 		if email != "" && key != "" {
@@ -420,26 +451,37 @@ func getAllDnsRecords(ctx *cli.Context) ([]*zoneDnsRecord, error) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("error sending request: %w", err)
+			return zones, fmt.Errorf("error sending request: %w", err)
 		}
+		defer func(Body io.ReadCloser) {
+			err := Body.Close()
+			if err != nil {
+				log.Printf("error closing response body: %v", err)
+			}
+		}(resp.Body)
 
 		decoder := json.NewDecoder(resp.Body)
-		var response listZoneDnsRecordsResponse
+		var response listZonesResponse
 		err = decoder.Decode(&response)
 		if err != nil {
-			return nil, fmt.Errorf("error decoding response: %w", err)
+			return zones, fmt.Errorf("error decoding response: %w", err)
 		}
 
 		if !response.Success {
-			return nil, fmt.Errorf("error response: %v", response.Errors)
+			return zones, fmt.Errorf("error response: %v", response.Errors)
 		}
 
-		zoneDnsRecords = append(zoneDnsRecords, response.Result...)
-		err = resp.Body.Close()
-		if err != nil {
-			log.Printf("error closing response body: %v", err)
+		if len(response.Result) == 0 {
+			break
 		}
+
+		if verbose {
+			fmt.Printf("Found %d zones\n", len(response.Result))
+		}
+
+		zones = append(zones, response.Result...)
+		page++
 	}
 
-	return zoneDnsRecords, nil
+	return zones, nil
 }
