@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  push:
+    branches: [ "master" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Login
+        run: docker login -u ${{ secrets.DOCKER_LOGIN }} --password ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build
+        run: |
+          docker buildx build -t sdrobov/cf-zone-backup:aarch64 --platform=linux/aarch64 .
+          docker buildx build -t sdrobov/cf-zone-backup:amd64 --platform=linux/amd64 .
+
+      - name: Push
+        run: |
+          docker push sdrobov/cf-zone-backup:aarch64
+          docker push sdrobov/cf-zone-backup:amd64
+
+      - name: Create manifest
+        run: |
+          docker manifest create sdrobov/cf-zone-backup:latest sdrobov/cf-zone-backup:amd64 sdrobov/cf-zone-backup:aarch64
+          docker manifest push sdrobov/cf-zone-backup:latest

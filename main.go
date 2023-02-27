@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/urfave/cli/v2"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
+	"reflect"
 )
 
 type (
@@ -49,9 +50,6 @@ type (
 		OriginalNameServers []string         `json:"original_name_servers"`
 		OriginalRegistrar   string           `json:"original_registrar"`
 		OriginalDnshost     string           `json:"original_dnshost"`
-		CreatedOn           time.Time        `json:"created_on"`
-		ModifiedOn          time.Time        `json:"modified_on"`
-		ActivatedOn         time.Time        `json:"activated_on"`
 		Owner               *zoneOwner       `json:"owner"`
 		Account             *zoneAccount     `json:"account"`
 		Permissions         []string         `json:"permissions"`
@@ -73,21 +71,19 @@ type (
 		Source    string `json:"source"`
 	}
 	zoneDnsRecord struct {
-		Id         string             `json:"id"`
-		Type       string             `json:"type"`
-		Name       string             `json:"name"`
-		Content    string             `json:"content"`
-		Proxiable  bool               `json:"proxiable"`
-		Proxied    bool               `json:"proxied"`
-		Comment    string             `json:"comment"`
-		Tags       []string           `json:"tags"`
-		Ttl        int                `json:"ttl"`
-		Locked     bool               `json:"locked"`
-		ZoneId     string             `json:"zone_id"`
-		ZoneName   string             `json:"zone_name"`
-		CreatedOn  time.Time          `json:"created_on"`
-		ModifiedOn time.Time          `json:"modified_on"`
-		Meta       *zoneDnsRecordMeta `json:"meta"`
+		Id        string             `json:"id"`
+		Type      string             `json:"type"`
+		Name      string             `json:"name"`
+		Content   string             `json:"content"`
+		Proxiable bool               `json:"proxiable"`
+		Proxied   bool               `json:"proxied"`
+		Comment   string             `json:"comment"`
+		Tags      []string           `json:"tags"`
+		Ttl       int                `json:"ttl"`
+		Locked    bool               `json:"locked"`
+		ZoneId    string             `json:"zone_id"`
+		ZoneName  string             `json:"zone_name"`
+		Meta      *zoneDnsRecordMeta `json:"meta"`
 	}
 	listZoneDnsRecordsResponse struct {
 		Success  bool             `json:"success"`
@@ -178,7 +174,12 @@ func restoreZones(ctx *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("error opening backup file: %w", err)
 	}
-	defer backup.Close()
+	defer func(backup *os.File) {
+		err := backup.Close()
+		if err != nil {
+			log.Printf("error closing backup file: %v", err)
+		}
+	}(backup)
 
 	decoder := json.NewDecoder(backup)
 	var dnsRecords []*zoneDnsRecord
@@ -191,9 +192,40 @@ func restoreZones(ctx *cli.Context) error {
 		fmt.Printf("restoring %d dns records\n", len(dnsRecords))
 	}
 
-	for i, dnsRecord := range dnsRecords {
+	existingDnsRecords, err := getAllDnsRecords(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting existing dns records: %w", err)
+	}
+
+	var forUpdate, forDelete, forCreate []*zoneDnsRecord
+	existingDnsRecordsMap := make(map[string]*zoneDnsRecord, len(existingDnsRecords))
+	for _, dnsRecord := range existingDnsRecords {
+		existingDnsRecordsMap[dnsRecord.Id] = dnsRecord
+	}
+	backupDnsRecordsMap := make(map[string]*zoneDnsRecord, len(dnsRecords))
+	for _, dnsRecord := range dnsRecords {
+		existingDnsRecord, ok := existingDnsRecordsMap[dnsRecord.Id]
+		if !ok {
+			forCreate = append(forCreate, dnsRecord)
+			continue
+		}
+		if !reflect.DeepEqual(dnsRecord, existingDnsRecord) {
+			forUpdate = append(forUpdate, dnsRecord)
+		}
+	}
+	for _, existingDnsRecord := range existingDnsRecords {
+		_, ok := backupDnsRecordsMap[existingDnsRecord.Id]
+		if !ok {
+			forDelete = append(forDelete, existingDnsRecord)
+		}
+	}
+
+	total := len(forCreate) + len(forUpdate) + len(forDelete)
+	i := 0
+	for _, dnsRecord := range forUpdate {
+		i += 1
 		if verbose {
-			fmt.Printf("restoring dns record %s; %d/%d\n", dnsRecord.Name, i+1, len(dnsRecords))
+			fmt.Printf("updating dns record %s; %d/%d\n", dnsRecord.Name, i, total)
 		}
 		body := &bytes.Buffer{}
 		err := json.NewEncoder(body).Encode(dnsRecord)
@@ -218,67 +250,18 @@ func restoreZones(ctx *cli.Context) error {
 		if err != nil {
 			return fmt.Errorf("error sending request: %w", err)
 		}
-		resp.Body.Close()
-	}
-
-	return nil
-}
-
-func backupZones(ctx *cli.Context) error {
-	email := ctx.String("email")
-	key := ctx.String("key")
-	token := ctx.String("token")
-	if email == "" && key == "" && token == "" {
-		return fmt.Errorf("email & key or token must be provided")
-	}
-	dir := ctx.String("dir")
-	url := ctx.String("url")
-	if url == "" {
-		url = "https://api.cloudflare.com/client/v4/"
-	}
-	verbose := ctx.Bool("verbose")
-
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", url+"zones", nil)
-	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
-	}
-
-	if email != "" && key != "" {
-		req.Header.Add("X-Auth-Email", email)
-		req.Header.Add("X-Auth-Key", key)
-	} else {
-		req.Header.Add("Authorization", "Bearer "+token)
-	}
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("error sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	decoder := json.NewDecoder(resp.Body)
-	var response listZonesResponse
-	err = decoder.Decode(&response)
-	if err != nil {
-		return fmt.Errorf("error decoding response: %w", err)
-	}
-
-	if !response.Success {
-		return fmt.Errorf("error response: %v", response.Errors)
-	}
-
-	if verbose {
-		fmt.Printf("Found %d zones\n", len(response.Result))
-	}
-
-	forBackup := make([]*zoneDnsRecord, 0, len(response.Result))
-	for i, zone := range response.Result {
-		if verbose {
-			fmt.Printf("Backing up zone %s; %d/%d\n", zone.Name, i+1, len(response.Result))
+		err = resp.Body.Close()
+		if err != nil {
+			log.Printf("error closing response body: %v", err)
 		}
-		req, err := http.NewRequest("GET", url+"zones/"+zone.Id+"/dns_records", nil)
+	}
+	for _, dnsRecord := range forDelete {
+		i += 1
+		if verbose {
+			fmt.Printf("deleting dns record %s; %d/%d\n", dnsRecord.Name, i, total)
+		}
+		client := &http.Client{}
+		req, err := http.NewRequest("DELETE", url+"zones/"+dnsRecord.ZoneId+"/dns_records/"+dnsRecord.Id, nil)
 		if err != nil {
 			return fmt.Errorf("error creating request: %w", err)
 		}
@@ -295,27 +278,65 @@ func backupZones(ctx *cli.Context) error {
 		if err != nil {
 			return fmt.Errorf("error sending request: %w", err)
 		}
-		defer resp.Body.Close()
-
-		decoder := json.NewDecoder(resp.Body)
-		var response listZoneDnsRecordsResponse
-		err = decoder.Decode(&response)
+		err = resp.Body.Close()
 		if err != nil {
-			return fmt.Errorf("error decoding response: %w", err)
+			log.Printf("error closing response body: %v", err)
+		}
+	}
+	for _, dnsRecord := range forCreate {
+		i += 1
+		if verbose {
+			fmt.Printf("creating dns record %s; %d/%d\n", dnsRecord.Name, i, total)
+		}
+		body := &bytes.Buffer{}
+		err := json.NewEncoder(body).Encode(dnsRecord)
+		if err != nil {
+			return fmt.Errorf("error encoding dns record: %w", err)
+		}
+		client := &http.Client{}
+		req, err := http.NewRequest("POST", url+"zones/"+dnsRecord.ZoneId+"/dns_records", body)
+		if err != nil {
+			return fmt.Errorf("error creating request: %w", err)
 		}
 
-		if !response.Success {
-			return fmt.Errorf("error response: %v", response.Errors)
+		if email != "" && key != "" {
+			req.Header.Add("X-Auth-Email", email)
+			req.Header.Add("X-Auth-Key", key)
+		} else {
+			req.Header.Add("Authorization", "Bearer "+token)
 		}
+		req.Header.Add("Content-Type", "application/json")
 
-		forBackup = append(forBackup, response.Result...)
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("error sending request: %w", err)
+		}
+		err = resp.Body.Close()
+		if err != nil {
+			log.Printf("error closing response body: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func backupZones(ctx *cli.Context) error {
+	dir := ctx.String("dir")
+	forBackup, err := getAllDnsRecords(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting all dns records: %w", err)
 	}
 
 	backupFile, err := os.Create(dir + "backup.json")
 	if err != nil {
 		return fmt.Errorf("error creating backup file: %w", err)
 	}
-	defer backupFile.Close()
+	defer func(backupFile *os.File) {
+		err := backupFile.Close()
+		if err != nil {
+			log.Printf("error closing backup file: %v", err)
+		}
+	}(backupFile)
 
 	encoder := json.NewEncoder(backupFile)
 	err = encoder.Encode(forBackup)
@@ -324,4 +345,101 @@ func backupZones(ctx *cli.Context) error {
 	}
 
 	return nil
+}
+
+func getAllDnsRecords(ctx *cli.Context) ([]*zoneDnsRecord, error) {
+	email := ctx.String("email")
+	key := ctx.String("key")
+	token := ctx.String("token")
+	if email == "" && key == "" && token == "" {
+		return nil, fmt.Errorf("email & key or token must be provided")
+	}
+	url := ctx.String("url")
+	if url == "" {
+		url = "https://api.cloudflare.com/client/v4/"
+	}
+	verbose := ctx.Bool("verbose")
+
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", url+"zones", nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	if email != "" && key != "" {
+		req.Header.Add("X-Auth-Email", email)
+		req.Header.Add("X-Auth-Key", key)
+	} else {
+		req.Header.Add("Authorization", "Bearer "+token)
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error sending request: %w", err)
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			log.Printf("error closing response body: %v", err)
+		}
+	}(resp.Body)
+
+	decoder := json.NewDecoder(resp.Body)
+	var response listZonesResponse
+	err = decoder.Decode(&response)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding response: %w", err)
+	}
+
+	if !response.Success {
+		return nil, fmt.Errorf("error response: %v", response.Errors)
+	}
+
+	if verbose {
+		fmt.Printf("Found %d zones\n", len(response.Result))
+	}
+
+	zoneDnsRecords := make([]*zoneDnsRecord, 0, len(response.Result))
+	for i, zone := range response.Result {
+		if verbose {
+			fmt.Printf("Fetching zone %s; %d/%d\n", zone.Name, i+1, len(response.Result))
+		}
+		req, err := http.NewRequest("GET", url+"zones/"+zone.Id+"/dns_records", nil)
+		if err != nil {
+			return nil, fmt.Errorf("error creating request: %w", err)
+		}
+
+		if email != "" && key != "" {
+			req.Header.Add("X-Auth-Email", email)
+			req.Header.Add("X-Auth-Key", key)
+		} else {
+			req.Header.Add("Authorization", "Bearer "+token)
+		}
+		req.Header.Add("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("error sending request: %w", err)
+		}
+
+		decoder := json.NewDecoder(resp.Body)
+		var response listZoneDnsRecordsResponse
+		err = decoder.Decode(&response)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding response: %w", err)
+		}
+
+		if !response.Success {
+			return nil, fmt.Errorf("error response: %v", response.Errors)
+		}
+
+		zoneDnsRecords = append(zoneDnsRecords, response.Result...)
+		err = resp.Body.Close()
+		if err != nil {
+			log.Printf("error closing response body: %v", err)
+		}
+	}
+
+	return zoneDnsRecords, nil
 }
